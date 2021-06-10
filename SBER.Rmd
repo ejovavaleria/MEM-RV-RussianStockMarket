@@ -1,0 +1,2154 @@
+---
+title: "SBER"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(matrixcalc)
+library(Matrix)
+library(foreach)
+```
+
+Data preparation
+```{r}
+#downloading data
+sber = read.csv("~/THESIS/SBER.csv", sep = ";")
+sber = sber %>% select(X.DATE., X.CLOSE., X.VOL.)
+n = nrow(sber)
+
+#log-return construction 
+sber_return = log(sber[2:n, "X.CLOSE."]) - log(sber[1:(n-1), "X.CLOSE."])
+sber_return = c(0, sber_return)
+sber$return = sber_return
+sber$return = as.numeric(sber$return)
+
+#realized volatility construction
+sber = sber %>% group_by(X.DATE.) %>% mutate(rv = sum(return^2))
+
+#realized volatility frame
+date = unique(sber$X.DATE.)
+rv = unique(sber$rv)
+RV_sber = data.frame(date, rv)
+plot.ts(RV_sber$rv, type = "l", ylab = "RV", xlab = "Time")
+d <- density(RV_sber$rv)
+plot(d, main = "",  xlab = "RV") 
+
+#date construction
+RV_sber$year = str_sub(RV_sber$date, 1, 4)
+RV_sber$month = str_sub(RV_sber$date, 5, 6)
+RV_sber$day = str_sub(RV_sber$date, 7, 8)
+RV_sber$date = str_c(RV_sber$year, RV_sber$month, RV_sber$day, sep=".")
+RV_sber = RV_sber %>% select(-year) %>% select(-month) %>% select(-day)
+RV_sber$date = ymd(RV_sber$date)
+```
+
+Splitting data
+```{r}
+#train - test 
+train <- 1:400
+valid <- 401:nrow(RV_sber)
+rv_all <- RV_sber$rv
+rv_train  <- RV_sber$rv[train]
+rv_valid <- RV_sber$rv[valid]
+```
+
+Baseline(1,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- par[1]+par[2]*log(rvo)+par[3]*log(muo)
+  for(t in 2:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=2:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=2:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-1,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(3,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+coef_11 = fit1$par #-0.8558772  0.5433318  0.3363614
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.12212447 0.01463548 0.01505641
+t1 <- fit1$par / se1 #-7.008237 37.124300 22.340081
+pv1 <- (1-pnorm(abs(t1)))/2 #6.033507e-13 0.000000e+00 0.000000e+00
+
+eps11 <- eps(fit1$par)
+acf(eps11)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.590025
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5666.142
+```
+
+BASELINE(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*lmu[1]+par[4]*log(rvo)
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_train[t-2])
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(rv_train[t-2]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(4,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.3655158  0.5426038  0.6425402 -0.2383885
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.08819383 0.01058046 0.01087028 0.01057660
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #8.515388e-06 0.000000e+00 0.000000e+00 0.000000e+00
+
+eps21 <- eps(fit1$par)
+plot(acf(eps21), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_all[t-2])
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5735535
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5665.77
+```
+
+BASELINE(1,2)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*lmu[1]+par[4]*log(muo)
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*lmu[t-2]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(mu1[t-2]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(4,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+fit1$par #-0.7214833  0.5482618  0.1515669  0.1965075
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.15934192 0.01911160 0.01964334 0.01965082
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #1.489361e-06 0.000000e+00 2.997602e-15 0.000000e+00
+
+eps12 <- eps(fit1$par)
+acf(eps12)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*lmu[t-2]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5813638
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5666.123
+```
+
+BASELINE(2,2)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*lmu[1]+par[4]*log(rvo)+par[5]*log(muo)
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_train[t-2])+par[5]*lmu[t-2]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(rv_train[t-2]), log(mu1[t-2]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03,0.1))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05,0.1))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03,0.1))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+coef_22 = fit1$par #-0.5184911  0.5559790  0.3580880 -0.1381866  0.1489969
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.15106717 0.01812011 0.01862125 0.01812439 0.01862754
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #1.496826e-04 0.000000e+00 0.000000e+00 6.106227e-15 3.330669e-16
+
+eps22 <- eps(fit1$par)
+acf(eps22)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_all[t-2])+par[5]*lmu[t-2]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5774945
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5664.201
+```
+
+BASELINE(3,2)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  mu2 <- exp(coef_22[1]+coef_22[2]*log(rv_train[1])+coef_22[3]*log(mu1)+coef_22[4]*log(rvo)+coef_22[5]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- log(mu2)
+  lmu[3] <- par[1]+par[2]*log(rv_train[2])+par[3]*lmu[2]+par[4]*log(rv_train[1])+par[5]*lmu[1]+par[6]*log(rvo)
+  for(t in 4:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_train[t-2])+par[5]*lmu[t-2]+par[6]*log(rv_train[t-3])
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=4:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(rv_train[t-2]), log(mu1[t-2]), log(rv_train[t-3]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=4:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-3,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05,0.1,-0.1))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(6,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+fit1$par #-1.0170261  0.5280177  1.1443156 -0.5225798 -0.7867530  0.4987337
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.20265219 0.02427270 0.02490567 0.02428270 0.02492085 0.02428652 
+t1 <- fit1$par / se1
+pv1 <- (1-pnorm(abs(t1)))/2 #1.301375e-07 0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00
+
+eps32 <- eps(fit1$par)
+acf(eps32)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_all[t-2])+par[5]*lmu[t-2]+par[6]*log(rv_all[t-3])
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.598336
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5670.02
+```
+
+BASELINE(2,3)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  mu2 <- exp(coef_22[1]+coef_22[2]*log(rv_train[1])+coef_22[3]*log(mu1)+coef_22[4]*log(rvo)+coef_22[5]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- log(mu2)
+  lmu[3] <- par[1]+par[2]*log(rv_train[2])+par[3]*lmu[2]+par[4]*log(rv_train[1])+par[5]*lmu[1]+par[6]*log(muo)
+  for(t in 4:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_train[t-2])+par[5]*lmu[t-2]+par[6]*lmu[t-3]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=4:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(rv_train[t-2]), log(mu1[t-2]), log(mu1[t-3]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=4:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-3,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05,0.1,-0.1))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03,0.1,-0.1))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(6,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+fit1$par #-0.9584763  0.5626054 -0.3433930  0.2627966  0.1423548  0.2354751
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.34904346 0.04183479 0.04299123 0.04184468 0.04302213 0.04303123 
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #1.508130e-03 0.000000e+00 3.330669e-16 8.448686e-11 2.341812e-04 1.111265e-08
+
+eps23 <- eps(fit1$par)
+acf(eps23)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_all[t-2])+par[5]*lmu[t-2]+par[6]*lmu[t-3]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5790595
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5662.934
+```
+
+BASELINE(3,3)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  mu2 <- exp(coef_22[1]+coef_22[2]*log(rv_train[1])+coef_22[3]*log(mu1)+coef_22[4]*log(rvo)+coef_22[5]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- log(mu2)
+  lmu[3] <- par[1]+par[2]*log(rv_train[2])+par[3]*lmu[2]+par[4]*log(rv_train[1])+par[5]*lmu[1]+par[6]*log(rvo)+par[7]*log(muo)
+  for(t in 4:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_train[t-2])+par[5]*lmu[t-2]+par[6]*log(rv_train[t-3])+par[7]*lmu[t-3]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1,-0.1,0.5))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=4:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(rv_train[t-2]), log(mu1[t-2]), log(rv_train[t-3]), log(mu1[t-3]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1,-0.1,0.5))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1,-0.1,0.5))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03,0.1,-0.1,0.5))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=4:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-3,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05,0.1,-0.1,0.5))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03,0.1,-0.1,0.5))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(7,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+fit1$par #-1.1907488  0.5344784  0.9196851 -0.4424080 -0.9135283  0.5272225  0.2119263
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.30572548 0.03669549 0.03766600 0.03671259 0.03767957 0.03671741 0.03767845
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #2.456692e-05 0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 4.648413e-09
+
+eps33 <- eps(fit1$par)
+acf(eps33)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_all[t-2])+par[5]*lmu[t-2]+par[6]*log(rv_all[t-3])+par[7]*lmu[t-3]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.6014271
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5665.926
+```
+
+BASELINE(3,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  mu2 <- exp(coef_22[1]+coef_22[2]*log(rv_train[1])+coef_22[3]*log(mu1)+coef_22[4]*log(rvo)+coef_22[5]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- log(mu2)
+  lmu[3] <- par[1]+par[2]*log(rv_train[2])+par[3]*lmu[2]+par[4]*log(rv_train[1])+par[5]*log(rvo)
+  for(t in 4:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_train[t-2])+par[5]*log(rv_train[t-3])
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=4:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(rv_train[t-2]), log(rv_train[t-3]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03,0.1))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=4:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-3,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05,0.1))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03,0.1))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+fit1$par #-0.6350202  0.5569416  0.4069345 -0.1851236  0.1295570
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.17835513 0.02137761 0.02197174 0.02138331 0.02138749
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #9.256358e-05 0.000000e+00 0.000000e+00 0.000000e+00 3.454039e-10
+
+eps31 <- eps(fit1$par)
+acf(eps31)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*log(rv_all[t-2])+par[5]*log(rv_all[t-3])
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5758198
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5664.95
+```
+
+BASELINE(1,3)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  mu2 <- exp(coef_22[1]+coef_22[2]*log(rv_train[1])+coef_22[3]*log(mu1)+coef_22[4]*log(rvo)+coef_22[5]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- log(mu2)
+  lmu[3] <- par[1]+par[2]*log(rv_train[2])+par[3]*lmu[2]+par[4]*lmu[1]+par[5]*log(muo)
+  for(t in 4:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*lmu[t-1]+par[4]*lmu[t-2]+par[5]*lmu[t-3]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=4:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(mu1[t-1]), log(mu1[t-2]), log(mu1[t-3]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03,0.1))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=4:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-3,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05,0.1))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03,0.1))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+fit1$par #-0.6493045  0.5594087  0.0840414  0.0636810  0.1979072
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.19673157 0.02360839 0.02425662 0.02425670 0.02426151
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #2.413171e-04 0.000000e+00 1.327158e-04 2.164344e-03 1.110223e-16
+
+eps13 <- eps(fit1$par)
+acf(eps13)
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*lmu[t-1]+par[4]*lmu[t-2]+par[5]*lmu[t-3]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5750954
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5664.735
+```
+
+VOLUME 
+```{r}
+days = data.frame(1:506, date)
+colnames(sber)[1] <- "date"
+sber = sber %>% left_join(days, by="date")
+
+daily_volume = sber %>% group_by(X1.506) %>% summarise(daily_volume=sum(X.VOL.))
+colnames(daily_volume)[1] <- "day"
+RV_sber$day = c(1:506)
+RV_sber = RV_sber %>% left_join(daily_volume, by = "day")
+volume_change = c()
+for (i in 2:length(RV_sber$day)){
+  change = (RV_sber$daily_volume[i]-RV_sber$daily_volume[i-1])/RV_sber$daily_volume[i-1]
+  volume_change = c(volume_change, change)
+}
+volume_change = c(0,volume_change)
+RV_sber$volume_change = volume_change
+
+vc_all = RV_sber$volume_change
+vc_train  <- RV_sber$volume_change[train]
+vc_valid <- RV_sber$volume_change[valid]
+```
+
+VOLUME(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*vc_train[1]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*vc_train[t-1]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), vc_train[t-1])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.2922967  0.3785753 -0.1769114  0.7599141  0.2091222
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.081215918 0.010171012 0.009743835 0.010048430 0.549886470
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #7.985836e-05 0.000000e+00 0.000000e+00 0.000000e+00 1.759305e-01
+
+eps21_volume <- eps(fit1$par)
+plot(acf(eps21_volume), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*vc_all[t-1]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.553397
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5668.884
+```
+
+LEVERAGE
+```{r}
+daily_return = c()
+for (i in 1:length(date)){
+  day = sber %>% filter(X1.506 == i)
+  l = length(day$date)
+  r = log(day$X.CLOSE.[l])-log(day$X.CLOSE.[1])
+  daily_return = c(daily_return, r)
+}
+RV_sber$daily_return = daily_return
+RV_sber$neg_dr = ifelse(RV_sber$daily_return<0,RV_sber$daily_return,0)
+
+neg_dr_all = RV_sber$neg_dr
+neg_dr_train  <- RV_sber$neg_dr[train]
+neg_dr_valid <- RV_sber$neg_dr[valid]
+```
+
+LEVERAGE(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*neg_dr_train[1]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*neg_dr_train[t-1]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), neg_dr_train[t-1])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-1.9963838   0.2968567   0.1244756   0.3378259 -18.0773397
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.22405192  0.02728344  0.02703438  0.02776322 26.49500406
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #0.000000e+00 0.000000e+00 1.034414e-06 0.000000e+00 1.237635e-01
+
+eps21_leverage <- eps(fit1$par)
+plot(acf(eps21_leverage), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*neg_dr_all[t-1]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.6110624
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5681.069
+```
+
+INDEX
+```{r}
+moex = read.csv("~/THESIS/IMOEX.csv", sep = ";")
+moex = moex %>% select(X.DATE., X.CLOSE., X.VOL.)
+n = nrow(moex)
+
+moex_return = log(moex[2:n, "X.CLOSE."]) - log(moex[1:(n-1), "X.CLOSE."])
+moex_return = c(0, moex_return)
+moex$return = moex_return
+moex$return = as.numeric(moex$return)
+
+moex = moex %>% group_by(X.DATE.) %>% mutate(rv = sum(return^2))
+
+date = unique(moex$X.DATE.)
+rv = unique(moex$rv)
+RV_moex = data.frame(date, rv)
+plot(RV_moex$rv, type = "l")
+
+RV_moex$year = str_sub(RV_moex$date, 1, 4)
+RV_moex$month = str_sub(RV_moex$date, 5, 6)
+RV_moex$day = str_sub(RV_moex$date, 7, 8)
+RV_moex$date = str_c(RV_moex$year, RV_moex$month, RV_moex$day, sep=".")
+RV_moex = RV_moex %>% select(-year) %>% select(-month) %>% select(-day)
+RV_moex$date = ymd(RV_moex$date)
+RV_moex = RV_moex[-111,]
+
+index_all = RV_moex$rv
+index_train  <- RV_moex$rv[train]
+index_valid <- RV_moex$rv[valid]
+```
+
+INDEX(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*log(index_train[1])
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*log(index_train[t-1])
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), log(index_train[t-1]))
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.334903365  0.543937830 -0.268219798  0.673882980  0.001410304
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.10068708 0.01208343 0.01208332 0.01241635 0.01037335
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #0.0002201124 0.0000000000 0.0000000000 0.0000000000 0.2229643063
+
+eps21_index <- eps(fit1$par)
+plot(acf(eps21_index), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*log(index_all[t-1])
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5763288
+2*length(fit1$par)-2*(-nLL(fit1$par)) #5663.733
+```
+
+DAY OF THE WEEK
+```{r}
+RV_sber$weekday = as.factor(weekdays(RV_sber$date))
+condition = RV_sber$weekday == "Friday" | RV_sber$weekday == "Monday" | RV_sber$date == "2018-01-03" | RV_sber$date == "2018-01-05" | RV_sber$date == "2018-01-09" | RV_sber$date == "2018-02-22" | RV_sber$date == "2018-02-26" | RV_sber$date == "2018-03-07" | RV_sber$date == "2018-03-09" | RV_sber$date == "2018-04-30" | RV_sber$date == "2018-05-02" | RV_sber$date == "2018-05-08" | RV_sber$date == "2018-05-10" | RV_sber$date == "2018-06-09" | RV_sber$date == "2018-06-13" | RV_sber$date == "2018-11-02" | RV_sber$date == "2018-11-06" | RV_sber$date == "2018-12-29" | RV_sber$date == "2019-01-03" | RV_sber$date == "2019-02-22" | RV_sber$date == "2019-02-25" | RV_sber$date == "2019-03-07" | RV_sber$date == "2019-03-11" | RV_sber$date == "2019-04-30" | RV_sber$date == "2019-05-02" | RV_sber$date == "2019-05-08" | RV_sber$date == "2019-05-10" | RV_sber$date == "2019-06-11" | RV_sber$date == "2019-06-13" | RV_sber$date == "2019-11-01" | RV_sber$date == "2019-11-05" | RV_sber$date == "2019-12-30" 
+RV_sber$day_of_the_week = ifelse(condition, T, F)
+
+day_all = RV_sber$day_of_the_week
+day_train  <- RV_sber$day_of_the_week[train]
+day_valid <- RV_sber$day_of_the_week[valid]
+```
+
+DAY(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*day_train[2]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*day_train[t]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), day_train[t])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.5033453  0.5579359 -0.2127000  0.5899832  0.1194555
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.14084769 0.01689045 0.01690494 0.01737063 0.28414098
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #8.799807e-05 0.000000e+00 0.000000e+00 0.000000e+00 1.685466e-01
+
+eps21_day <- eps(fit1$par)
+plot(acf(eps21_day), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*day_all[t]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5758921
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5665.564
+```
+
+EXPIRATION
+```{r}
+condition = RV_sber$date == "2018-03-13" | RV_sber$date == "2018-03-14" | RV_sber$date == "2018-03-15" | RV_sber$date == "2018-03-16" | RV_sber$date == "2018-06-19" | RV_sber$date == "2018-06-20" | RV_sber$date == "2018-06-21" | RV_sber$date == "2018-06-22" | RV_sber$date == "2018-09-18" | RV_sber$date == "2018-09-19" | RV_sber$date == "2018-09-20" | RV_sber$date == "2018-09-21" | RV_sber$date == "2018-12-18" | RV_sber$date == "2018-12-19" | RV_sber$date == "2018-12-20" | RV_sber$date == "2018-12-21" | RV_sber$date == "2019-03-19" | RV_sber$date == "2019-03-20" | RV_sber$date == "2019-03-21" | RV_sber$date == "2019-03-22" | RV_sber$date == "2019-06-18" | RV_sber$date == "2019-06-19" | RV_sber$date == "2019-06-20" | RV_sber$date == "2019-06-21" | RV_sber$date == "2019-09-17" | RV_sber$date == "2019-09-18" | RV_sber$date == "2019-09-19" | RV_sber$date == "2019-09-20" | RV_sber$date == "2019-12-17" | RV_sber$date == "2019-12-18" | RV_sber$date == "2019-12-19" | RV_sber$date == "2019-12-20"
+RV_sber$expiration = ifelse(condition, T, F)
+
+exp_all = RV_sber$expiration
+exp_train  <- RV_sber$expiration[train]
+exp_valid <- RV_sber$expiration[valid]
+```
+
+EXPIRATION (2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*day_train[2]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*exp_train[t]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), exp_train[t])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.32194455  0.55399405 -0.27809417  0.67723295  0.03159015
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.08608439 0.01031215 0.01030902 0.01059549 1.40689291
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #4.976306e-06 0.000000e+00 0.000000e+00 0.000000e+00 2.475013e-01
+
+eps21_exp <- eps(fit1$par)
+plot(acf(eps21_exp), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*exp_all[t]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5747199
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5663.853
+```
+
+CPI
+```{r}
+cpi = read.csv("~/THESIS/CPI.csv", sep = ",")
+cpi$date = dmy(cpi$date)
+
+RV_sber$month = month(RV_sber$date)
+RV_sber$year = year(RV_sber$date)
+RV_sber$my = str_c(RV_sber$month, RV_sber$year)
+RV_sber = RV_sber %>% select(-month, -year)
+my = unique(RV_sber$my)
+month = c(1:24)
+m = data.frame(my, month)
+RV_sber = RV_sber %>% left_join(m)
+cpi$month = c(0:24)
+RV_sber$month[278]
+cpi$inflation[RV_sber$month[278]]
+
+cpi_all = cpi$inflation
+```
+
+CPI(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*cpi_all[RV_sber$month[2]]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*cpi_all[RV_sber$month[t]]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), cpi_all[RV_sber$month[t]])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.35441686  0.54954408 -0.28128956  0.67766375 -0.07076824
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.09753842 0.01168628 0.01168817 0.01200403 0.25184168
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #6.987007e-05 0.000000e+00 0.000000e+00 0.000000e+00 1.946770e-01
+
+eps21_cpi <- eps(fit1$par)
+plot(acf(eps21_cpi), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*cpi_all[RV_sber$month[t]]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.6335021
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5664.438
+```
+
+IP
+```{r}
+ip = read.csv("~/THESIS/IP.csv", sep = ",")
+ip$date = dmy(ip$date)
+
+ip_all = ip$ip
+```
+
+IP(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*ip_all[RV_sber$month[2]]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*ip_all[RV_sber$month[t]]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), ip_all[RV_sber$month[t]])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(5,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-0.329349037  0.550602579 -0.259146583  0.658158742 -0.005582585
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.10272651 0.01233799 0.01233585 0.01267170 0.03443409
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #0.0003363958 0.0000000000 0.0000000000 0.0000000000 0.2178020903
+
+eps21_ip <- eps(fit1$par)
+plot(acf(eps21_ip), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*ip_all[RV_sber$month[t]]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.5760802
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5664.003
+```
+
+ALL(2,1)
+```{r}
+mu <- function(par) {
+  muo <- mean(rv_train)
+  rvo <- muo
+  mu1 <- exp(coef_11[1]+coef_11[2]*log(rvo)+coef_11[3]*log(muo))
+  
+  lmu <- rep(NA,length(rv_train))
+  lmu[1] <- log(mu1)
+  lmu[2] <- par[1]+par[2]*log(rv_train[1])+par[3]*log(rvo)+par[4]*lmu[1]+par[5]*vc_train[1]+par[6]*neg_dr_train[1]+par[7]*log(index_train[1])+par[8]*day_train[2]+par[9]*exp_train[2]+par[10]*cpi_all[RV_sber$month[2]]+par[11]*ip_all[RV_sber$month[2]]
+  for(t in 3:length(rv_train)) {
+    lmu[t] <- par[1]+par[2]*log(rv_train[t-1])+par[3]*log(rv_train[t-2])+par[4]*lmu[t-1]+par[5]*vc_train[t-1]+par[6]*neg_dr_train[t-1]+par[7]*log(index_train[t-1])+par[8]*day_train[t]+par[9]*exp_train[t]+par[10]*cpi_all[RV_sber$month[t]]+par[11]*ip_all[RV_sber$month[t]]
+  }
+  
+  return(exp(lmu))
+}
+
+#mu(c(0.2,-0.2,+0.05,0.03,0.1,1,1,1,1,1,1))
+
+dmu <- function(par) {
+  mu1 <- mu(par)
+  
+  foreach(t=3:length(rv_train), .combine=rbind) %do% {
+    mu1[t]*c(1, log(rv_train[t-1]), log(rv_train[t-2]), log(mu1[t-1]), vc_train[t-1],  neg_dr_train[t-1], log(index_train[t-1]), day_train[t], exp_train[t], cpi_all[RV_sber$month[t]],  ip_all[RV_sber$month[t]])
+  }
+}
+
+#dmu(c(0.2,-0.2,+0.05,0.03,0.1,1,1,1,1,1,1))
+
+nLL <- function(par) {
+  mu1 <- mu(par)
+  ll  <- -rv_train/mu1 - log(mu1)
+  return(-sum(ll))
+}
+
+#nLL(c(0.2,-0.2,+0.05,0.03,0.1))
+
+eps <- function(par) {
+  rv_train/mu(par)
+}
+
+#eps(c(0.2,-0.2,+0.05,0.03))
+
+s <- function(par) {
+  mu1 <- mu(par)
+  dmu1 <- dmu(par)
+  foreach(t=3:length(rv_train),.combine=rbind) %do% {
+    dmu1[t-2,]*(rv_train[t]/mu1[t]^2-1/mu1[t])
+  }
+}
+
+#s(c(0.2,-0.2,+0.05,-0.05))
+
+nLLgr <- function(par) {
+  -colSums(s(par))
+}
+
+#nLLgr(c(0.2,-0.2,+0.05,0.03))
+
+vcov <- function(par,Hess) {
+  s1 <- s(par)
+  n <- nrow(s1)
+  
+  bunn <- (-Hess/n)^(-1)
+  
+  meat <- Reduce('+',lapply(1:n, function(i) matrix((s1[i,]),ncol(s1),1)%*%matrix(s1[i,],1,ncol(s1))))/n
+
+  forceSymmetric(bunn %*% meat %*% bunn)
+}
+
+#estimation
+B <- 300
+fits <- foreach(b=1:B,
+                .errorhandling = 'remove',
+                .packages = c("foreach")) %do% { 
+  paro <- runif(11,-5,5)
+  fit1 <- optim(paro, nLL, nLLgr, method="BFGS",hessian=TRUE)
+}
+
+nLLs <- foreach(fit=fits,.combine=c) %do% {
+  if(fit1$convergence == 0) {
+    fit$value
+  } else {
+    +9999
+  }
+}
+
+fit1 <- fits[[which.min(nLLs)]]
+is.positive.definite(fit1$hessian)
+colMeans(s(fit1$par))
+
+vcov1 <- vcov(fit1$par,fit1$hessian)
+is.positive.definite(matrix(as.numeric(vcov1),ncol(vcov1),ncol(vcov1)))
+det(vcov1)
+
+
+fit1$par #-2.045066427   0.330940765   0.069358941   0.367041388   0.020029607 -16.895800354 -0.011207968   0.115251894   0.007484823  -0.107629438  -0.001954494
+se1 <- sqrt(diag(vcov1)/length(rv_train)) #0.35289049  0.04260962  0.04258599  0.04356352  3.20005450 47.88056808  0.03648602  0.74681639  6.61220151  0.95604341  0.11975595
+t1 <- fit1$par / se1 
+pv1 <- (1-pnorm(abs(t1)))/2 #1.706127e-09 1.998401e-15 2.584521e-02 0.000000e+00 2.487515e-01 1.810458e-01 1.896756e-01 2.193385e-01 2.497742e-01 2.275913e-01 2.467446e-01
+
+eps21_all <- eps(fit1$par)
+plot(acf(eps21_all), main="")
+
+muf <- function(par) {
+  lmu <- log(rv_all)
+  for(t in valid) {
+    lmu[t] <- par[1]+par[2]*log(rv_all[t-1])+par[3]*log(rv_all[t-2])+par[4]*lmu[t-1]+par[5]*vc_all[t-1]+par[6]*neg_dr_all[t-1]+par[7]*log(index_all[t-1])+par[8]*day_all[t]+par[9]*exp_all[t]+par[10]*cpi_all[RV_sber$month[t]]+par[11]*ip_all[RV_sber$month[t]]
+  }
+  return(exp(lmu[valid]))
+}
+#validation RMSE for log(RV)
+sqrt(mean((log(rv_valid) - log(muf(fit1$par)))^2)) #0.6575
+2*length(fit1$par)-2*(-nLL(fit1$par)) #-5671.22
+```
+
+
